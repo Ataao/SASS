@@ -1,3 +1,4 @@
 #!/bin/sh
-mongo < script.js
-#mongosh < script.js
+docker build -t mongodb-container .
+docker run -dp 27017:27017 mongodb-container
+docker exec -t mongodb-container "mongosh < script.js"
