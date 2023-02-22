@@ -1,120 +1,116 @@
-# vim:set ft=dockerfile:
+
+#
+# NOTE: THIS DOCKERFILE IS GENERATED VIA "apply-templates.sh"
+#
+# PLEASE DO NOT EDIT IT DIRECTLY.
+#
+
 FROM ubuntu:jammy
 
 # add our user and group first to make sure their IDs get assigned consistently, regardless of whatever dependencies get added
-RUN groupadd -r mysql && useradd -r -g mysql mysql
-ENV GOSU_VERSION 1.14
+RUN set -eux; \
+	groupadd --gid 999 --system mongodb; \
+	useradd --uid 999 --system --gid mongodb --home-dir /data/db mongodb; \
+	mkdir -p /data/db /data/configdb; \
+	chown -R mongodb:mongodb /data/db /data/configdb
 
-ARG GPG_KEYS=177F4010FE56CA3336300305F1656F24C74CD1D8
 RUN set -eux; \
 	apt-get update; \
-	DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-		ca-certificates \
-		gpg \
-		gpgv \
-		libjemalloc2 \
-		pwgen \
-		tzdata \
-		xz-utils \
-		zstd ; \
-	savedAptMark="$(apt-mark showmanual)"; \
 	apt-get install -y --no-install-recommends \
+		ca-certificates \
 		dirmngr \
-		gpg-agent \
-		wget; \
+		gnupg \
+		jq \
+		numactl \
+		procps \
+	; \
+	rm -rf /var/lib/apt/lists/*
+
+# grab gosu for easy step-down from root (https://github.com/tianon/gosu/releases)
+ENV GOSU_VERSION 1.16
+# grab "js-yaml" for parsing mongod's YAML config files (https://github.com/nodeca/js-yaml/releases)
+ENV JSYAML_VERSION 3.13.1
+
+RUN set -ex; \
+	\
+	savedAptMark="$(apt-mark showmanual)"; \
+	apt-get update; \
+	apt-get install -y --no-install-recommends \
+		wget \
+	; \
 	rm -rf /var/lib/apt/lists/*; \
+	\
 	dpkgArch="$(dpkg --print-architecture | awk -F- '{ print $NF }')"; \
-	wget -q -O /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch"; \
-	wget -q -O /usr/local/bin/gosu.asc "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch.asc"; \
-	GNUPGHOME="$(mktemp -d)"; \
-	export GNUPGHOME; \
+	wget -O /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch"; \
+	wget -O /usr/local/bin/gosu.asc "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch.asc"; \
+	export GNUPGHOME="$(mktemp -d)"; \
 	gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys B42F6819007F00F88E364FD4036A9C25BF357DD4; \
-	for key in $GPG_KEYS; do \
-		gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "$key"; \
-	done; \
-	gpg --batch --export "$GPG_KEYS" > /etc/apt/trusted.gpg.d/mariadb.gpg; \
-	if command -v gpgconf >/dev/null; then \
-		gpgconf --kill all; \
-	fi; \
 	gpg --batch --verify /usr/local/bin/gosu.asc /usr/local/bin/gosu; \
 	gpgconf --kill all; \
 	rm -rf "$GNUPGHOME" /usr/local/bin/gosu.asc; \
+	\
+	wget -O /js-yaml.js "https://github.com/nodeca/js-yaml/raw/${JSYAML_VERSION}/dist/js-yaml.js"; \
+# TODO some sort of download verification here
+	\
 	apt-mark auto '.*' > /dev/null; \
-	[ -z "$savedAptMark" ] ||	apt-mark manual $savedAptMark >/dev/null; \
+	apt-mark manual $savedAptMark > /dev/null; \
 	apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false; \
+	\
+# smoke test
 	chmod +x /usr/local/bin/gosu; \
 	gosu --version; \
 	gosu nobody true
 
 RUN mkdir /docker-entrypoint-initdb.d
-ENV LANG C.UTF-8
-LABEL org.opencontainers.image.authors="MariaDB Community" \
-      org.opencontainers.image.title="MariaDB Database" \
-      org.opencontainers.image.description="MariaDB Database for relational SQL" \
-      org.opencontainers.image.documentation="https://hub.docker.com/_/mariadb/" \
-      org.opencontainers.image.base.name="docker.io/library/ubuntu:jammy" \
-      org.opencontainers.image.licenses="GPL-2.0" \
-      org.opencontainers.image.source="https://github.com/MariaDB/mariadb-docker" \
-      org.opencontainers.image.vendor="MariaDB Community" \
-      org.opencontainers.image.version="10.11.2" \
-      org.opencontainers.image.url="https://github.com/MariaDB/mariadb-docker"
 
-# bashbrew-architectures: amd64 arm64v8 ppc64le s390x
-ARG MARIADB_VERSION=1:10.11.2+maria~ubu2204
-ENV MARIADB_VERSION $MARIADB_VERSION
-# release-status:Stable
-# (https://downloads.mariadb.org/rest-api/mariadb/)
-
-# Allowing overriding of REPOSITORY, a URL that includes suite and component for testing and Enterprise Versions
-ARG REPOSITORY="http://archive.mariadb.org/mariadb-10.11.2/repo/ubuntu/ jammy main"
-
-RUN set -e;\
-	echo "deb ${REPOSITORY}" > /etc/apt/sources.list.d/mariadb.list; \
-	{ \
-		echo 'Package: *'; \
-		echo 'Pin: release o=MariaDB'; \
-		echo 'Pin-Priority: 999'; \
-	} > /etc/apt/preferences.d/mariadb
-# add repository pinning to make sure dependencies from this MariaDB repo are preferred over Debian dependencies
-#  libmariadbclient18 : Depends: libmysqlclient18 (= 5.5.42+maria-1~wheezy) but 5.5.43-0+deb7u1 is to be installed
-
-# the "/var/lib/mysql" stuff here is because the mysql-server postinst doesn't have an explicit way to disable the mysql_install_db codepath besides having a database already "configured" (ie, stuff in /var/lib/mysql/mysql)
-# also, we set debconf keys to make APT a little quieter
-# hadolint ignore=DL3015
 RUN set -ex; \
-	{ \
-		echo "mariadb-server" mysql-server/root_password password 'unused'; \
-		echo "mariadb-server" mysql-server/root_password_again password 'unused'; \
-	} | debconf-set-selections; \
-	apt-get update; \
-# mariadb-backup is installed at the same time so that `mysql-common` is only installed once from just mariadb repos
-	apt-get install -y --no-install-recommends mariadb-server="$MARIADB_VERSION" mariadb-backup socat \
-	; \
-	rm -rf /var/lib/apt/lists/*; \
-# purge and re-create /var/lib/mysql with appropriate ownership
-	rm -rf /var/lib/mysql; \
-	mkdir -p /var/lib/mysql /var/run/mysqld; \
-	chown -R mysql:mysql /var/lib/mysql /var/run/mysqld; \
-# ensure that /var/run/mysqld (used for socket and lock files) is writable regardless of the UID our mysqld instance ends up having at runtime
-	chmod 777 /var/run/mysqld; \
-# comment out a few problematic configuration values
-	find /etc/mysql/ -name '*.cnf' -print0 \
-		| xargs -0 grep -lZE '^(bind-address|log|user\s)' \
-		| xargs -rt -0 sed -Ei 's/^(bind-address|log|user\s)/#&/'; \
-# don't reverse lookup hostnames, they are usually another container
-	printf "[mariadb]\nhost-cache-size=0\nskip-name-resolve\n" > /etc/mysql/mariadb.conf.d/05-skipcache.cnf; \
-# Issue #327 Correct order of reading directories /etc/mysql/mariadb.conf.d before /etc/mysql/conf.d (mount-point per documentation)
-	if [ -L /etc/mysql/my.cnf ]; then \
-# 10.5+
-		sed -i -e '/includedir/ {N;s/\(.*\)\n\(.*\)/\n\2\n\1/}' /etc/mysql/mariadb.cnf; \
-	fi
+	export GNUPGHOME="$(mktemp -d)"; \
+	set -- '39BD841E4BE5FB195A65400E6A26B1AE64C3C388'; \
+	for key; do \
+		gpg --batch --keyserver keyserver.ubuntu.com --recv-keys "$key"; \
+	done; \
+	mkdir -p /etc/apt/keyrings; \
+	gpg --batch --export "$@" > /etc/apt/keyrings/mongodb.gpg; \
+	gpgconf --kill all; \
+	rm -rf "$GNUPGHOME"
 
+# Allow build-time overrides (eg. to build image with MongoDB Enterprise version)
+# Options for MONGO_PACKAGE: mongodb-org OR mongodb-enterprise
+# Options for MONGO_REPO: repo.mongodb.org OR repo.mongodb.com
+# Example: docker build --build-arg MONGO_PACKAGE=mongodb-enterprise --build-arg MONGO_REPO=repo.mongodb.com .
+ARG MONGO_PACKAGE=mongodb-org
+ARG MONGO_REPO=repo.mongodb.org
+ENV MONGO_PACKAGE=${MONGO_PACKAGE} MONGO_REPO=${MONGO_REPO}
 
-VOLUME /var/lib/mysql
+ENV MONGO_MAJOR 6.0
+RUN echo "deb [ signed-by=/etc/apt/keyrings/mongodb.gpg ] http://$MONGO_REPO/apt/ubuntu jammy/${MONGO_PACKAGE%-unstable}/$MONGO_MAJOR multiverse" | tee "/etc/apt/sources.list.d/${MONGO_PACKAGE%-unstable}.list"
 
-COPY healthcheck.sh /usr/local/bin/healthcheck.sh
+# https://docs.mongodb.org/master/release-notes/6.0/
+ENV MONGO_VERSION 6.0.4
+# 01/17/2023, https://github.com/mongodb/mongo/tree/44ff59461c1353638a71e710f385a566bcd2f547
+
+RUN set -x \
+# installing "mongodb-enterprise" pulls in "tzdata" which prompts for input
+	&& export DEBIAN_FRONTEND=noninteractive \
+	&& apt-get update \
+	&& apt-get install -y \
+		${MONGO_PACKAGE}=$MONGO_VERSION \
+		${MONGO_PACKAGE}-server=$MONGO_VERSION \
+		${MONGO_PACKAGE}-shell=$MONGO_VERSION \
+		${MONGO_PACKAGE}-mongos=$MONGO_VERSION \
+		${MONGO_PACKAGE}-tools=$MONGO_VERSION \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& rm -rf /var/lib/mongodb \
+	&& mv /etc/mongod.conf /etc/mongod.conf.orig
+
+VOLUME /data/db /data/configdb
+
+# ensure that if running as custom user that "mongosh" has a valid "HOME"
+# https://github.com/docker-library/mongo/issues/524
+ENV HOME /data/db
+
 COPY docker-entrypoint.sh /usr/local/bin/
 ENTRYPOINT ["docker-entrypoint.sh"]
 
-EXPOSE 3306
-CMD ["mariadbd"]
+EXPOSE 27017
+CMD ["mongod"]
